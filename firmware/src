@@ -1,0 +1,299 @@
+/*
+  VisionDrive – Demo Firmware (Tag der offenen Tür / Showcase)
+  - Display: TTGO T-Display (TFT_eSPI)
+  - Servo: ESP32Servo
+  - Temp: DHT11
+  - Air: MQ135 (Analog)
+  - GPS: NEO-6M (TinyGPSPlus via HardwareSerial)
+
+  Basierend auf eurem Demo-Code / Stand 13.1.26 (PDF) :contentReference[oaicite:1]{index=1}
+  Verbesserungen:
+  - Nicht-blockierendes Timing (millis statt delay)
+  - Zustandslogik HUD (Einfahren/Ausfahren)
+  - Stabilere Anzeige (nur zyklisch refresh)
+  - Sanity-Checks & Fallbacks
+
+  Hinweis: Pinbelegung ggf. an euer Board anpassen!
+*/
+
+#include <TFT_eSPI.h>
+#include <ESP32Servo.h>
+#include <DHT.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+
+// ---------------- DISPLAY ----------------
+TFT_eSPI tft = TFT_eSPI();
+
+// ---------------- SERVO ----------------
+Servo myServo;
+static const int SERVO_PIN = 13;  // "sicherer Pin auf TTGO T-Display" aus eurer Demo :contentReference[oaicite:2]{index=2}
+
+// Servo-Positionen (an euren Mechanismus anpassen)
+static const int SERVO_STOW   = 0;    // eingefahren
+static const int SERVO_DEPLOY = 90;   // ausgefahren (Demo)
+
+enum HudState { HUD_STOWED, HUD_DEPLOYED };
+HudState hudState = HUD_DEPLOYED; // Startzustand: ausgefahren (Demo)
+
+// ---------------- DHT11 ----------------
+static const int DHTPIN = 27;
+static const int DHTTYPE = DHT11;
+DHT dht(DHTPIN, DHTTYPE);
+
+// ---------------- MQ135 ----------------
+static const int MQ135_PIN = 34; // analog input
+// Optional: einfache Glättung
+static const float AIR_SMOOTH_ALPHA = 0.2f;
+float airSmoothed = 0;
+
+// ---------------- GPS ----------------
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1);
+static const int GPS_RX = 32;
+static const int GPS_TX = 33;
+static const uint32_t GPS_BAUD = 9600;
+
+// ---------------- TIMING ----------------
+static const uint32_t SENSOR_INTERVAL_MS = 500;    // Sensor refresh
+static const uint32_t DISPLAY_INTERVAL_MS = 250;   // Display refresh
+static const uint32_t SERIAL_INTERVAL_MS  = 1000;  // Serial log
+
+uint32_t lastSensorMs = 0;
+uint32_t lastDisplayMs = 0;
+uint32_t lastSerialMs = 0;
+
+// ---------------- MEASUREMENTS ----------------
+float temperatureC = NAN;
+int airRaw = 0;
+
+bool gpsValid = false;
+double gpsLat = 0.0;
+double gpsLon = 0.0;
+uint32_t gpsSat = 0;
+double gpsSpeedKmph = 0.0;
+
+// ---------------- UI helpers ----------------
+static void uiHeader(const char* title);
+static void uiKeyValue(int x, int y, const char* key, const String& value);
+static String fmtFloat(double v, int decimals);
+static void readSensors();
+static void readGpsStream();
+static void renderDisplay();
+static void logSerial();
+static void handleButtonsOrDemoLogic(); // optional: HUD toggle demo
+
+// Optional: Wenn euer TTGO T-Display Buttons hat (GPIO 0/35 o.ä.), hier definieren.
+// Für maximale Portabilität ist es aktuell deaktiviert.
+static const bool USE_BUTTONS = false;
+
+void setup() {
+  Serial.begin(115200);
+
+  // GPS starten :contentReference[oaicite:3]{index=3}
+  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  // Display starten :contentReference[oaicite:4]{index=4}
+  tft.init();
+  tft.setRotation(1); // Querformat
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  uiHeader("VisionDrive Demo");
+  tft.setCursor(10, 40);
+  tft.setTextSize(2);
+  tft.println("System startet...");
+  delay(800);
+
+  // Servo starten (HUD hoch) :contentReference[oaicite:5]{index=5}
+  myServo.setPeriodHertz(50);     // Standard servo PWM
+  myServo.attach(SERVO_PIN, 500, 2400); // min/max pulses (typisch)
+  myServo.write(SERVO_DEPLOY);
+  hudState = HUD_DEPLOYED;
+
+  // Sensoren
+  dht.begin();
+
+  // Init smoothing
+  airRaw = analogRead(MQ135_PIN);
+  airSmoothed = airRaw;
+
+  tft.fillScreen(TFT_BLACK);
+}
+
+void loop() {
+  // GPS-Stream kontinuierlich einlesen
+  readGpsStream();
+
+  // Optional: Demo-Interaktion (z.B. HUD togglen)
+  handleButtonsOrDemoLogic();
+
+  const uint32_t now = millis();
+
+  // Sensoren zyklisch
+  if (now - lastSensorMs >= SENSOR_INTERVAL_MS) {
+    lastSensorMs = now;
+    readSensors();
+  }
+
+  // Display zyklisch
+  if (now - lastDisplayMs >= DISPLAY_INTERVAL_MS) {
+    lastDisplayMs = now;
+    renderDisplay();
+  }
+
+  // Serial zyklisch
+  if (now - lastSerialMs >= SERIAL_INTERVAL_MS) {
+    lastSerialMs = now;
+    logSerial();
+  }
+}
+
+// ---------------- IMPLEMENTATION ----------------
+
+static void readGpsStream() {
+  while (gpsSerial.available()) {
+    gps.encode(gpsSerial.read());
+  }
+
+  gpsValid = gps.location.isValid();
+  if (gpsValid) {
+    gpsLat = gps.location.lat();
+    gpsLon = gps.location.lng();
+  }
+
+  gpsSat = gps.satellites.isValid() ? gps.satellites.value() : 0;
+  gpsSpeedKmph = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
+}
+
+static void readSensors() {
+  // Temp
+  float t = dht.readTemperature();
+  temperatureC = t; // bleibt NAN falls invalid
+
+  // Air (MQ135 analog)
+  airRaw = analogRead(MQ135_PIN);
+  airSmoothed = AIR_SMOOTH_ALPHA * airRaw + (1.0f - AIR_SMOOTH_ALPHA) * airSmoothed;
+}
+
+static void renderDisplay() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(2);
+
+  // Header
+  uiHeader("HUD Anzeige");
+
+  // Row 1: Speed (GPS)
+  String speedStr;
+  if (gps.speed.isValid()) speedStr = fmtFloat(gpsSpeedKmph, 1) + " km/h";
+  else speedStr = "--";
+  uiKeyValue(10, 35, "Speed", speedStr);
+
+  // Row 2: Temp
+  String tempStr;
+  if (isnan(temperatureC)) tempStr = "--";
+  else tempStr = fmtFloat(temperatureC, 1) + " C";
+  uiKeyValue(10, 60, "Temp", tempStr);
+
+  // Row 3: Air (raw + smoothed)
+  String airStr = String((int)airSmoothed) + " (raw " + String(airRaw) + ")";
+  uiKeyValue(10, 85, "Luft", airStr);
+
+  // Row 4: GPS status
+  String gpsStr;
+  if (gpsValid) {
+    gpsStr = "Fix " + String(gpsSat) + " Sat";
+  } else {
+    gpsStr = "kein Signal";
+  }
+  uiKeyValue(10, 110, "GPS", gpsStr);
+
+  // Bottom: Coordinates (smaller)
+  tft.setTextSize(1);
+  tft.setCursor(10, 135);
+  if (gpsValid) {
+    tft.print("Lat ");
+    tft.print(gpsLat, 5);
+    tft.print("  Lon ");
+    tft.print(gpsLon, 5);
+  } else {
+    tft.print("Lat --  Lon --");
+  }
+
+  // HUD state indicator
+  tft.setCursor(10, 150);
+  tft.print("HUD: ");
+  tft.print((hudState == HUD_DEPLOYED) ? "AUSGEFAHREN" : "EINGEFAHREN");
+}
+
+static void logSerial() {
+  Serial.println("----- VISIONDRIVE DEMO -----");
+
+  Serial.print("HUD State: ");
+  Serial.println((hudState == HUD_DEPLOYED) ? "DEPLOYED" : "STOWED");
+
+  Serial.print("Temperatur (C): ");
+  if (isnan(temperatureC)) Serial.println("N/A");
+  else Serial.println(temperatureC, 1);
+
+  Serial.print("Luftqualitaet (raw/smoothed): ");
+  Serial.print(airRaw);
+  Serial.print(" / ");
+  Serial.println((int)airSmoothed);
+
+  if (gpsValid) {
+    Serial.print("GPS Fix: YES, Sat: ");
+    Serial.println(gpsSat);
+    Serial.print("Lat/Lon: ");
+    Serial.print(gpsLat, 6);
+    Serial.print(" / ");
+    Serial.println(gpsLon, 6);
+
+    Serial.print("Speed (km/h): ");
+    Serial.println(gpsSpeedKmph, 1);
+  } else {
+    Serial.println("GPS Fix: NO");
+  }
+}
+
+static void handleButtonsOrDemoLogic() {
+  // Für Tag-der-offenen-Tür-Demos ist ein "Auto-Toggle" oft praktisch:
+  // Alle 10 Sekunden Servo bewegen (zeigen, dass Mechanik lebt),
+  // ohne den Rest zu blockieren.
+  static uint32_t lastToggleMs = 0;
+  static const uint32_t TOGGLE_INTERVAL_MS = 10000;
+
+  uint32_t now = millis();
+  if (now - lastToggleMs >= TOGGLE_INTERVAL_MS) {
+    lastToggleMs = now;
+
+    if (hudState == HUD_DEPLOYED) {
+      myServo.write(SERVO_STOW);
+      hudState = HUD_STOWED;
+    } else {
+      myServo.write(SERVO_DEPLOY);
+      hudState = HUD_DEPLOYED;
+    }
+  }
+}
+
+static void uiHeader(const char* title) {
+  tft.setTextSize(2);
+  tft.setCursor(10, 5);
+  tft.println(title);
+  // kleine Trennlinie
+  tft.drawFastHLine(0, 28, tft.width(), TFT_DARKGREY);
+}
+
+static void uiKeyValue(int x, int y, const char* key, const String& value) {
+  tft.setCursor(x, y);
+  tft.print(key);
+  tft.print(": ");
+  tft.println(value);
+}
+
+static String fmtFloat(double v, int decimals) {
+  char buf[32];
+  dtostrf(v, 0, decimals, buf);
+  return String(buf);
+}
