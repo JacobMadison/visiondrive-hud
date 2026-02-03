@@ -13,7 +13,6 @@
   - Stabilere Anzeige (nur zyklisch refresh)
   - Sanity-Checks & Fallbacks
 
-  Hinweis: Pinbelegung ggf. an euer Board anpassen!
 */
 
 #include <TFT_eSPI.h>
@@ -27,7 +26,7 @@ TFT_eSPI tft = TFT_eSPI();
 
 // ---------------- SERVO ----------------
 Servo myServo;
-static const int SERVO_PIN = 13;  // "sicherer Pin auf TTGO T-Display" aus eurer Demo :contentReference[oaicite:2]{index=2}
+static const int SERVO_PIN = 13;  // "sicherer Pin auf TTGO T-Display" aus Demo :contentReference[oaicite:2]{index=2}
 
 // Servo-Positionen (an euren Mechanismus anpassen)
 static const int SERVO_STOW   = 0;    // eingefahren
@@ -83,7 +82,7 @@ static void renderDisplay();
 static void logSerial();
 static void handleButtonsOrDemoLogic(); // optional: HUD toggle demo
 
-// Optional: Wenn euer TTGO T-Display Buttons hat (GPIO 0/35 o.ä.), hier definieren.
+// Wenn  TTGO T-Display Buttons hat (GPIO 0/35 o.ä.), hier definieren.
 // Für maximale Portabilität ist es aktuell deaktiviert.
 static const bool USE_BUTTONS = false;
 
@@ -257,7 +256,7 @@ static void logSerial() {
 }
 
 static void handleButtonsOrDemoLogic() {
-  // Für Tag-der-offenen-Tür-Demos ist ein "Auto-Toggle" oft praktisch:
+  // Für Tag-der-offenen-Tür-Demo ist ein "Auto-Toggle" oft praktisch:
   // Alle 10 Sekunden Servo bewegen (zeigen, dass Mechanik lebt),
   // ohne den Rest zu blockieren.
   static uint32_t lastToggleMs = 0;
