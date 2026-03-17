@@ -1,0 +1,831 @@
+/*
+  ============================================================
+  VisionDrive - umfassendes Demo-Programm
+  ============================================================
+
+  Enthaltene Funktionen:
+  - GPS-Speed über NEO-6M (TinyGPSPlus)
+  - DHT11 Temperatur / Luftfeuchte
+  - MQ135 Luftqualitaet mit Glaettung
+  - Servo fuer HUD ein-/ausfahren
+  - Zustandsmodell (BOOT, CONNECT, ACTIVE, ALERT, STANDBY)
+  - Optionale OBD-II Geschwindigkeit via ELM327 / Bluetooth
+  - Nicht-blockierendes Timing mit millis()
+  - Fail-Safe / Platzhalter bei ungueltigen Daten
+  - Serielles Logging
+  - Gespiegeltes HUD-Rendering fuer Combiner-Reflexion
+  - Helligkeitsmodi (optional mit Backlight-Pin)
+
+  Hardware-Basis:
+  - ESP32 / TTGO T-Display
+  - TFT_eSPI
+  - ESP32Servo
+  - DHT11
+  - MQ135
+  - GPS NEO-6M
+  - optional: Bluetooth OBD-II Adapter (ELM327)
+
+  ------------------------------------------------------------
+  WICHTIG VOR DEM EINSATZ:
+  1) In TFT_eSPI die richtige Display-Konfiguration aktivieren
+  2) Pins unten mit eurer Hardware abgleichen
+  3) Falls ihr keinen OBD-Adapter nutzt: USE_OBD = false lassen
+  4) Falls ihr kein Backlight per PWM steuern wollt:
+     BACKLIGHT_PIN auf -1 lassen
+  ------------------------------------------------------------
+*/
+
+#include <Arduino.h>
+#include <TFT_eSPI.h>
+#include <ESP32Servo.h>
+#include <DHT.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+#include <BluetoothSerial.h>
+#include <math.h>
+
+// ============================================================
+// ---------------------- KONFIGURATION ------------------------
+// ============================================================
+
+// ---------------- Display ----------------
+TFT_eSPI tft = TFT_eSPI();
+TFT_eSprite hudSprite = TFT_eSprite(&tft);
+
+// Bei manchen TTGO T-Display Boards ist das Backlight an GPIO 4.
+// Falls ihr das nicht braucht oder euer Board anders ist: -1 lassen.
+static const int BACKLIGHT_PIN = -1;   // z.B. 4
+static const int BACKLIGHT_PWM_CHANNEL = 0;
+static const int BACKLIGHT_PWM_FREQ = 5000;
+static const int BACKLIGHT_PWM_RES = 8;
+
+// true = fuer Projektion spiegelverkehrt auf dem physikalischen Display ausgeben
+static const bool MIRROR_OUTPUT = true;
+
+// ---------------- Servo ----------------
+Servo hudServo;
+static const int SERVO_PIN = 13;
+static const int SERVO_STOW_ANGLE = 0;
+static const int SERVO_DEPLOY_ANGLE = 90;
+
+// ---------------- DHT11 ----------------
+static const int DHT_PIN = 27;
+static const int DHT_TYPE = DHT11;
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ---------------- MQ135 ----------------
+static const int MQ135_PIN = 34;
+static const float AIR_SMOOTH_ALPHA = 0.20f;
+
+// ---------------- GPS ----------------
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1);
+static const int GPS_RX = 32;
+static const int GPS_TX = 33;
+static const uint32_t GPS_BAUD = 9600;
+
+// ---------------- OBD-II (optional) ----------------
+static const bool USE_OBD = false;              // auf true setzen, wenn ELM327 genutzt wird
+static const char* OBD_DEVICE_NAME = "OBDII";   // Name eures Adapters
+BluetoothSerial SerialBT;
+
+// ---------------- Zeitintervalle ----------------
+static const uint32_t GPS_POLL_INTERVAL_MS     = 20;     // GPS-Stream quasi kontinuierlich
+static const uint32_t SENSOR_INTERVAL_MS       = 500;    // DHT + MQ135
+static const uint32_t DISPLAY_INTERVAL_MS      = 250;    // HUD refresh
+static const uint32_t SERIAL_INTERVAL_MS       = 1000;   // Debug-Ausgabe
+static const uint32_t OBD_QUERY_INTERVAL_MS    = 200;    // OBD Speed-Abfrage
+static const uint32_t ALERT_CHECK_INTERVAL_MS  = 300;
+
+// ---------------- Logik / Schwellwerte ----------------
+static const uint32_t GPS_FIX_TIMEOUT_MS       = 5000;
+static const float TEMP_ALERT_C                = 32.0f;
+static const float HUM_ALERT_PERCENT           = 85.0f;
+static const int AIR_ALERT_INDEX               = 1800;   // Demo-Schwelle, an Sensor anpassen
+
+// Bei Demo: alle 10 Sekunden HUD umschalten? false = normaler Betrieb
+static const bool DEMO_AUTO_TOGGLE_SERVO = false;
+static const uint32_t DEMO_TOGGLE_INTERVAL_MS = 10000;
+
+// ============================================================
+// ---------------------- DATENMODELLE ------------------------
+// ============================================================
+
+enum SystemState {
+  STATE_BOOT_SELFTEST,
+  STATE_CONNECTION_SYNC,
+  STATE_ACTIVE_DRIVING,
+  STATE_ALERT_MODE,
+  STATE_STANDBY
+};
+
+enum BrightnessMode {
+  BRIGHTNESS_DAY,
+  BRIGHTNESS_NORMAL,
+  BRIGHTNESS_NIGHT
+};
+
+struct SensorData {
+  // GPS
+  bool gpsValid = false;
+  double gpsLat = 0.0;
+  double gpsLon = 0.0;
+  double gpsSpeedKmph = 0.0;
+  uint32_t gpsSatellites = 0;
+  uint32_t lastGpsFixMs = 0;
+
+  // OBD
+  bool obdConnected = false;
+  bool obdSpeedValid = false;
+  float obdSpeedKmph = 0.0f;
+  uint32_t lastObdValueMs = 0;
+
+  // Klima
+  float temperatureC = NAN;
+  float humidityPercent = NAN;
+
+  // Luftqualitaet
+  int airRaw = 0;
+  float airSmoothed = 0.0f;
+
+  // Fehler / Zustand
+  bool tempValid = false;
+  bool humidityValid = false;
+};
+
+struct HudData {
+  float shownSpeedKmph = 0.0f;
+  bool speedValid = false;
+  const char* speedSource = "GPS";
+};
+
+SystemState currentState = STATE_BOOT_SELFTEST;
+BrightnessMode brightnessMode = BRIGHTNESS_NORMAL;
+
+SensorData data;
+HudData hud;
+
+bool hudDeployed = false;
+
+// ============================================================
+// ---------------------- ZEITMARKEN --------------------------
+// ============================================================
+
+uint32_t lastSensorMs = 0;
+uint32_t lastDisplayMs = 0;
+uint32_t lastSerialMs = 0;
+uint32_t lastObdQueryMs = 0;
+uint32_t lastAlertCheckMs = 0;
+uint32_t lastDemoToggleMs = 0;
+
+// ============================================================
+// ---------------------- FUNKTIONSDEKL. ----------------------
+// ============================================================
+
+void setupDisplay();
+void setupBacklight();
+void setBacklight(uint8_t value);
+void setupServo();
+void deployHud();
+void stowHud();
+
+void setupGps();
+void setupSensors();
+void setupObd();
+
+void updateStateMachine();
+void readGpsStream();
+void readClimateSensors();
+void readAirSensor();
+void readObdSpeed();
+bool parseObdSpeedResponse(const String& response, float& speedOut);
+
+void selectBestSpeedSource();
+void updateAlertsAndBrightness();
+void handleDemoServoToggle();
+
+void renderHud();
+void renderHudToSprite();
+void pushSpriteMirrored(TFT_eSprite& spr);
+void drawHeader(TFT_eSprite& spr, const char* title);
+void drawKeyValue(TFT_eSprite& spr, int x, int y, const String& key, const String& value, uint8_t textSize = 2);
+void drawCenteredText(TFT_eSprite& spr, int y, const String& text, uint8_t textSize = 2);
+String fmtFloat(double v, uint8_t decimals);
+String getStateName(SystemState st);
+
+void logSerial();
+
+// ============================================================
+// --------------------------- SETUP --------------------------
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  setupDisplay();
+  setupBacklight();
+  setupServo();
+  setupGps();
+  setupSensors();
+  if (USE_OBD) setupObd();
+
+  // Erstes Einlesen fuer stabile Startwerte
+  readAirSensor();
+  data.airSmoothed = data.airRaw;
+
+  currentState = STATE_BOOT_SELFTEST;
+
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(10, 20);
+  tft.println("VisionDrive");
+  tft.setCursor(10, 50);
+  tft.println("Booting...");
+  delay(800);
+
+  deployHud();
+  currentState = STATE_CONNECTION_SYNC;
+}
+
+// ============================================================
+// ---------------------------- LOOP --------------------------
+// ============================================================
+
+void loop() {
+  // 1) Datenstroeme moeglichst oft aktualisieren
+  readGpsStream();
+
+  if (DEMO_AUTO_TOGGLE_SERVO) {
+    handleDemoServoToggle();
+  }
+
+  // 2) Zeitgesteuerte Aufgaben
+  const uint32_t now = millis();
+
+  if (now - lastSensorMs >= SENSOR_INTERVAL_MS) {
+    lastSensorMs = now;
+    readClimateSensors();
+    readAirSensor();
+  }
+
+  if (USE_OBD && now - lastObdQueryMs >= OBD_QUERY_INTERVAL_MS) {
+    lastObdQueryMs = now;
+    readObdSpeed();
+  }
+
+  if (now - lastAlertCheckMs >= ALERT_CHECK_INTERVAL_MS) {
+    lastAlertCheckMs = now;
+    updateAlertsAndBrightness();
+    updateStateMachine();
+    selectBestSpeedSource();
+  }
+
+  if (now - lastDisplayMs >= DISPLAY_INTERVAL_MS) {
+    lastDisplayMs = now;
+    renderHud();
+  }
+
+  if (now - lastSerialMs >= SERIAL_INTERVAL_MS) {
+    lastSerialMs = now;
+    logSerial();
+  }
+}
+
+// ============================================================
+// ----------------------- INITIALISIERUNG --------------------
+// ============================================================
+
+void setupDisplay() {
+  tft.init();
+  tft.setRotation(1); // Querformat
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  hudSprite.setColorDepth(16);
+  hudSprite.createSprite(tft.width(), tft.height());
+}
+
+void setupBacklight() {
+  if (BACKLIGHT_PIN >= 0) {
+    ledcSetup(BACKLIGHT_PWM_CHANNEL, BACKLIGHT_PWM_FREQ, BACKLIGHT_PWM_RES);
+    ledcAttachPin(BACKLIGHT_PIN, BACKLIGHT_PWM_CHANNEL);
+    setBacklight(180);
+  }
+}
+
+void setBacklight(uint8_t value) {
+  if (BACKLIGHT_PIN >= 0) {
+    ledcWrite(BACKLIGHT_PWM_CHANNEL, value);
+  }
+}
+
+void setupServo() {
+  hudServo.setPeriodHertz(50);
+  hudServo.attach(SERVO_PIN, 500, 2400);
+  hudServo.write(SERVO_STOW_ANGLE);
+  hudDeployed = false;
+}
+
+void setupGps() {
+  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
+}
+
+void setupSensors() {
+  dht.begin();
+}
+
+void setupObd() {
+  if (!SerialBT.begin("VisionDriveHUD")) {
+    Serial.println("[OBD] BluetoothSerial konnte nicht gestartet werden.");
+    return;
+  }
+
+  Serial.println("[OBD] BluetoothSerial gestartet.");
+
+  // Optional: automatischer Connect-Versuch
+  bool ok = SerialBT.connect(OBD_DEVICE_NAME);
+  data.obdConnected = ok;
+
+  if (ok) {
+    Serial.println("[OBD] Verbunden mit ELM327.");
+    delay(300);
+    SerialBT.println("ATZ");
+    delay(500);
+    SerialBT.println("ATE0");
+    delay(200);
+    SerialBT.println("ATL0");
+    delay(200);
+    SerialBT.println("ATH0");
+    delay(200);
+    SerialBT.println("ATSP0");
+    delay(200);
+  } else {
+    Serial.println("[OBD] Verbindung fehlgeschlagen. GPS bleibt Fallback/Primarquelle.");
+  }
+}
+
+// ============================================================
+// -------------------------- AKTORIK -------------------------
+// ============================================================
+
+void deployHud() {
+  hudServo.write(SERVO_DEPLOY_ANGLE);
+  hudDeployed = true;
+}
+
+void stowHud() {
+  hudServo.write(SERVO_STOW_ANGLE);
+  hudDeployed = false;
+}
+
+void handleDemoServoToggle() {
+  const uint32_t now = millis();
+  if (now - lastDemoToggleMs >= DEMO_TOGGLE_INTERVAL_MS) {
+    lastDemoToggleMs = now;
+    if (hudDeployed) stowHud();
+    else deployHud();
+  }
+}
+
+// ============================================================
+// ---------------------- SENSOR-LOGIK ------------------------
+// ============================================================
+
+void readGpsStream() {
+  while (gpsSerial.available()) {
+    gps.encode(gpsSerial.read());
+  }
+
+  data.gpsValid = gps.location.isValid();
+
+  if (data.gpsValid) {
+    data.gpsLat = gps.location.lat();
+    data.gpsLon = gps.location.lng();
+    data.lastGpsFixMs = millis();
+  }
+
+  data.gpsSatellites = gps.satellites.isValid() ? gps.satellites.value() : 0;
+  data.gpsSpeedKmph = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
+}
+
+void readClimateSensors() {
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+
+  data.tempValid = !isnan(t);
+  data.humidityValid = !isnan(h);
+
+  data.temperatureC = data.tempValid ? t : NAN;
+  data.humidityPercent = data.humidityValid ? h : NAN;
+}
+
+void readAirSensor() {
+  data.airRaw = analogRead(MQ135_PIN);
+
+  // Exponentielle Glaettung
+  data.airSmoothed =
+      AIR_SMOOTH_ALPHA * data.airRaw +
+      (1.0f - AIR_SMOOTH_ALPHA) * data.airSmoothed;
+}
+
+void readObdSpeed() {
+  if (!USE_OBD) return;
+
+  if (!SerialBT.hasClient()) {
+    data.obdConnected = false;
+    data.obdSpeedValid = false;
+    return;
+  }
+
+  data.obdConnected = true;
+
+  // PID 0x0D = Geschwindigkeit
+  SerialBT.print("010D\r");
+  delay(40);
+
+  String response;
+  uint32_t startMs = millis();
+
+  while (millis() - startMs < 120) {
+    while (SerialBT.available()) {
+      char c = (char)SerialBT.read();
+      response += c;
+    }
+  }
+
+  float speed = 0.0f;
+  if (parseObdSpeedResponse(response, speed)) {
+    data.obdSpeedKmph = speed;
+    data.obdSpeedValid = true;
+    data.lastObdValueMs = millis();
+  } else {
+    data.obdSpeedValid = false;
+  }
+}
+
+bool parseObdSpeedResponse(const String& response, float& speedOut) {
+  // Typische Antwort: "41 0D 1A"
+  String clean = response;
+  clean.replace("\r", " ");
+  clean.replace("\n", " ");
+  clean.replace(">", " ");
+  clean.trim();
+
+  int idx = clean.indexOf("41 0D");
+  if (idx < 0) return false;
+
+  String tail = clean.substring(idx + 5);
+  tail.trim();
+
+  int spacePos = tail.indexOf(' ');
+  String speedHex = (spacePos >= 0) ? tail.substring(0, spacePos) : tail;
+  speedHex.trim();
+
+  if (speedHex.length() == 0) return false;
+
+  int speed = (int) strtol(speedHex.c_str(), nullptr, 16);
+  if (speed < 0 || speed > 255) return false;
+
+  speedOut = (float)speed; // km/h laut PID 0x0D
+  return true;
+}
+
+// ============================================================
+// ---------------------- SYSTEM-LOGIK ------------------------
+// ============================================================
+
+void selectBestSpeedSource() {
+  const uint32_t now = millis();
+
+  // Prioritaet:
+  // 1) OBD wenn verbunden und frisch
+  // 2) GPS wenn gueltig / vorhanden
+  // 3) sonst ungueltig
+
+  bool obdFresh = data.obdSpeedValid && (now - data.lastObdValueMs < 1500);
+  bool gpsFresh = data.gpsValid && (now - data.lastGpsFixMs < GPS_FIX_TIMEOUT_MS);
+
+  if (obdFresh) {
+    hud.shownSpeedKmph = data.obdSpeedKmph;
+    hud.speedValid = true;
+    hud.speedSource = "OBD";
+  } else if (gpsFresh) {
+    hud.shownSpeedKmph = (float)data.gpsSpeedKmph;
+    hud.speedValid = true;
+    hud.speedSource = "GPS";
+  } else {
+    hud.shownSpeedKmph = 0.0f;
+    hud.speedValid = false;
+    hud.speedSource = "--";
+  }
+}
+
+void updateAlertsAndBrightness() {
+  bool tempAlert = data.tempValid && data.temperatureC >= TEMP_ALERT_C;
+  bool humAlert  = data.humidityValid && data.humidityPercent >= HUM_ALERT_PERCENT;
+  bool airAlert  = ((int)data.airSmoothed) >= AIR_ALERT_INDEX;
+
+  // Sehr einfache Demo-Logik fuer Helligkeit:
+  // nachts / normal / hell - hier ohne Lichtsensor nur ueber Zustand
+  if (currentState == STATE_ALERT_MODE) {
+    brightnessMode = BRIGHTNESS_DAY;
+  } else {
+    // Einfacher Demo-Ansatz:
+    // Wenn Geschwindigkeit 0 oder kein Signal -> normal / night
+    if (!hud.speedValid || hud.shownSpeedKmph < 5.0f) {
+      brightnessMode = BRIGHTNESS_NIGHT;
+    } else {
+      brightnessMode = BRIGHTNESS_NORMAL;
+    }
+  }
+
+  if (BACKLIGHT_PIN >= 0) {
+    switch (brightnessMode) {
+      case BRIGHTNESS_DAY:    setBacklight(255); break;
+      case BRIGHTNESS_NORMAL: setBacklight(180); break;
+      case BRIGHTNESS_NIGHT:  setBacklight(90);  break;
+    }
+  }
+
+  // Zustandsumschaltung Richtung Alert wird in updateStateMachine() gemacht
+  (void)tempAlert;
+  (void)humAlert;
+  (void)airAlert;
+}
+
+void updateStateMachine() {
+  const uint32_t now = millis();
+
+  bool gpsReady = data.gpsValid || (now - data.lastGpsFixMs < GPS_FIX_TIMEOUT_MS);
+  bool tempAlert = data.tempValid && data.temperatureC >= TEMP_ALERT_C;
+  bool humAlert  = data.humidityValid && data.humidityPercent >= HUM_ALERT_PERCENT;
+  bool airAlert  = ((int)data.airSmoothed) >= AIR_ALERT_INDEX;
+  bool anyAlert = tempAlert || humAlert || airAlert;
+
+  switch (currentState) {
+    case STATE_BOOT_SELFTEST:
+      currentState = STATE_CONNECTION_SYNC;
+      break;
+
+    case STATE_CONNECTION_SYNC:
+      // Sobald zumindest Basisdaten vorhanden sind, in Aktivmodus
+      if (gpsReady || data.tempValid || data.airRaw > 0) {
+        currentState = STATE_ACTIVE_DRIVING;
+      }
+      break;
+
+    case STATE_ACTIVE_DRIVING:
+      if (anyAlert) {
+        currentState = STATE_ALERT_MODE;
+      }
+      break;
+
+    case STATE_ALERT_MODE:
+      if (!anyAlert) {
+        currentState = STATE_ACTIVE_DRIVING;
+      }
+      break;
+
+    case STATE_STANDBY:
+      // In einer echten Fahrzeuglogik waere das an Zuendung gekoppelt.
+      // Hier fuer Demo nicht aktiv genutzt.
+      break;
+  }
+}
+
+// ============================================================
+// ----------------------- UI / RENDERING ---------------------
+// ============================================================
+
+void renderHud() {
+  renderHudToSprite();
+
+  if (MIRROR_OUTPUT) {
+    pushSpriteMirrored(hudSprite);
+  } else {
+    hudSprite.pushSprite(0, 0);
+  }
+}
+
+void renderHudToSprite() {
+  hudSprite.fillSprite(TFT_BLACK);
+
+  uint16_t primaryColor = TFT_WHITE;
+  uint16_t secondaryColor = TFT_LIGHTGREY;
+  uint16_t alertColor = TFT_RED;
+  uint16_t okColor = TFT_GREEN;
+
+  switch (brightnessMode) {
+    case BRIGHTNESS_DAY:
+      primaryColor = TFT_WHITE;
+      secondaryColor = TFT_SILVER;
+      break;
+    case BRIGHTNESS_NORMAL:
+      primaryColor = TFT_WHITE;
+      secondaryColor = TFT_LIGHTGREY;
+      break;
+    case BRIGHTNESS_NIGHT:
+      primaryColor = TFT_LIGHTGREY;
+      secondaryColor = TFT_DARKGREY;
+      break;
+  }
+
+  hudSprite.setTextColor(primaryColor, TFT_BLACK);
+  drawHeader(hudSprite, "VisionDrive HUD");
+
+  // ---------------- Geschwindigkeit groß in der Mitte ----------------
+  String speedText = hud.speedValid ? String((int)round(hud.shownSpeedKmph)) : "--";
+  hudSprite.setTextColor(primaryColor, TFT_BLACK);
+  hudSprite.setTextDatum(MC_DATUM);
+  hudSprite.setTextSize(4);
+  hudSprite.drawString(speedText, hudSprite.width() / 2, 55);
+
+  hudSprite.setTextSize(2);
+  hudSprite.drawString("km/h", hudSprite.width() / 2, 92);
+
+  // ---------------- Quelle + GPS/OBD Status ----------------
+  hudSprite.setTextDatum(TL_DATUM);
+  hudSprite.setTextColor(secondaryColor, TFT_BLACK);
+  drawKeyValue(hudSprite, 8, 35, "Quelle", hud.speedSource, 1);
+
+  String stateText = getStateName(currentState);
+  drawKeyValue(hudSprite, 8, 48, "State", stateText, 1);
+
+  // ---------------- Temperatur ----------------
+  String tempText = data.tempValid ? fmtFloat(data.temperatureC, 1) + " C" : "--";
+  drawKeyValue(hudSprite, 8, 106, "Temp", tempText, 1);
+
+  // ---------------- Luftfeuchte ----------------
+  String humText = data.humidityValid ? fmtFloat(data.humidityPercent, 0) + " %" : "--";
+  drawKeyValue(hudSprite, 8, 119, "Hum", humText, 1);
+
+  // ---------------- Luftqualitaet ----------------
+  String airText = String((int)data.airSmoothed) + " / raw " + String(data.airRaw);
+  drawKeyValue(hudSprite, 8, 132, "Air", airText, 1);
+
+  // ---------------- GPS ----------------
+  String gpsText;
+  if (data.gpsValid) gpsText = "Fix " + String(data.gpsSatellites) + " Sat";
+  else gpsText = "kein Signal";
+  drawKeyValue(hudSprite, 120, 106, "GPS", gpsText, 1);
+
+  // ---------------- OBD ----------------
+  String obdText;
+  if (!USE_OBD) obdText = "aus";
+  else if (data.obdConnected) obdText = data.obdSpeedValid ? "aktiv" : "verb.";
+  else obdText = "offline";
+  drawKeyValue(hudSprite, 120, 119, "OBD", obdText, 1);
+
+  // ---------------- HUD-Status ----------------
+  drawKeyValue(hudSprite, 120, 132, "HUD", hudDeployed ? "ausgefahren" : "eingefahren", 1);
+
+  // ---------------- Koordinaten ----------------
+  hudSprite.setTextColor(secondaryColor, TFT_BLACK);
+  hudSprite.setTextSize(1);
+  hudSprite.setCursor(8, hudSprite.height() - 12);
+  if (data.gpsValid) {
+    hudSprite.printf("Lat %.5f  Lon %.5f", data.gpsLat, data.gpsLon);
+  } else {
+    hudSprite.print("Lat --  Lon --");
+  }
+
+  // ---------------- Warnoverlay ----------------
+  bool tempAlert = data.tempValid && data.temperatureC >= TEMP_ALERT_C;
+  bool humAlert  = data.humidityValid && data.humidityPercent >= HUM_ALERT_PERCENT;
+  bool airAlert  = ((int)data.airSmoothed) >= AIR_ALERT_INDEX;
+
+  if (currentState == STATE_ALERT_MODE) {
+    hudSprite.drawRoundRect(2, 24, hudSprite.width() - 4, hudSprite.height() - 28, 6, alertColor);
+    hudSprite.setTextDatum(TR_DATUM);
+    hudSprite.setTextSize(1);
+    hudSprite.setTextColor(alertColor, TFT_BLACK);
+
+    String alertMsg = "WARNUNG";
+    if (airAlert) alertMsg = "Luft pruefen";
+    else if (tempAlert) alertMsg = "Temp hoch";
+    else if (humAlert) alertMsg = "Feuchte hoch";
+
+    hudSprite.drawString(alertMsg, hudSprite.width() - 6, 30);
+  } else {
+    hudSprite.setTextDatum(TR_DATUM);
+    hudSprite.setTextSize(1);
+    hudSprite.setTextColor(okColor, TFT_BLACK);
+    hudSprite.drawString("OK", hudSprite.width() - 6, 30);
+  }
+}
+
+void pushSpriteMirrored(TFT_eSprite& spr) {
+  // Wir rendern normal ins Sprite und spiegeln dann horizontal auf das Display.
+  // Dadurch ist die physische Anzeige spiegelverkehrt und erscheint
+  // nach der Reflexion an der HUD-Scheibe wieder korrekt.
+
+  const int w = spr.width();
+  const int h = spr.height();
+
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) {
+      uint16_t c = spr.readPixel(x, y);
+      tft.drawPixel(w - 1 - x, y, c);
+    }
+  }
+}
+
+void drawHeader(TFT_eSprite& spr, const char* title) {
+  spr.setTextDatum(TL_DATUM);
+  spr.setTextSize(2);
+  spr.setCursor(8, 6);
+  spr.println(title);
+  spr.drawFastHLine(0, 24, spr.width(), TFT_DARKGREY);
+}
+
+void drawKeyValue(TFT_eSprite& spr, int x, int y, const String& key, const String& value, uint8_t textSize) {
+  spr.setTextDatum(TL_DATUM);
+  spr.setTextSize(textSize);
+  spr.setCursor(x, y);
+  spr.print(key);
+  spr.print(": ");
+  spr.print(value);
+}
+
+void drawCenteredText(TFT_eSprite& spr, int y, const String& text, uint8_t textSize) {
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextSize(textSize);
+  spr.drawString(text, spr.width() / 2, y);
+}
+
+String fmtFloat(double v, uint8_t decimals) {
+  char buf[32];
+  dtostrf(v, 0, decimals, buf);
+  return String(buf);
+}
+
+String getStateName(SystemState st) {
+  switch (st) {
+    case STATE_BOOT_SELFTEST:   return "BOOT";
+    case STATE_CONNECTION_SYNC: return "SYNC";
+    case STATE_ACTIVE_DRIVING:  return "ACTIVE";
+    case STATE_ALERT_MODE:      return "ALERT";
+    case STATE_STANDBY:         return "STBY";
+    default:                    return "?";
+  }
+}
+
+// ============================================================
+// ------------------------ DEBUG -----------------------------
+// ============================================================
+
+void logSerial() {
+  Serial.println();
+  Serial.println("========== VISIONDRIVE ==========");
+  Serial.print("State: ");
+  Serial.println(getStateName(currentState));
+
+  Serial.print("HUD: ");
+  Serial.println(hudDeployed ? "DEPLOYED" : "STOWED");
+
+  Serial.print("Speed valid: ");
+  Serial.println(hud.speedValid ? "YES" : "NO");
+
+  Serial.print("Speed source: ");
+  Serial.println(hud.speedSource);
+
+  Serial.print("Shown speed: ");
+  Serial.println(hud.shownSpeedKmph, 1);
+
+  Serial.print("GPS valid: ");
+  Serial.println(data.gpsValid ? "YES" : "NO");
+  Serial.print("GPS sats: ");
+  Serial.println(data.gpsSatellites);
+  Serial.print("GPS speed: ");
+  Serial.println(data.gpsSpeedKmph, 1);
+
+  Serial.print("OBD connected: ");
+  Serial.println(data.obdConnected ? "YES" : "NO");
+  Serial.print("OBD speed valid: ");
+  Serial.println(data.obdSpeedValid ? "YES" : "NO");
+  Serial.print("OBD speed: ");
+  Serial.println(data.obdSpeedKmph, 1);
+
+  Serial.print("Temp: ");
+  if (data.tempValid) Serial.println(data.temperatureC, 1);
+  else Serial.println("N/A");
+
+  Serial.print("Humidity: ");
+  if (data.humidityValid) Serial.println(data.humidityPercent, 0);
+  else Serial.println("N/A");
+
+  Serial.print("Air raw: ");
+  Serial.println(data.airRaw);
+
+  Serial.print("Air smooth: ");
+  Serial.println(data.airSmoothed, 1);
+
+  Serial.print("Brightness mode: ");
+  switch (brightnessMode) {
+    case BRIGHTNESS_DAY:    Serial.println("DAY"); break;
+    case BRIGHTNESS_NORMAL: Serial.println("NORMAL"); break;
+    case BRIGHTNESS_NIGHT:  Serial.println("NIGHT"); break;
+  }
+}
